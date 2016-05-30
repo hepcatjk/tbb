@@ -179,9 +179,6 @@ task* custom_scheduler<SchedulerTraits>::receive_or_steal_task( __TBB_atomic ref
                  || my_arena->recall_by_mandatory_request()
 #endif
                  ) ) {
-#if !__TBB_TASK_ARENA
-            __TBB_ASSERT( is_worker(), NULL );
-#endif
             if( SchedulerTraits::itt_possible && failure_count != -1 )
                 ITT_NOTIFY(sync_cancel, this);
             return NULL;
@@ -206,6 +203,7 @@ task* custom_scheduler<SchedulerTraits>::receive_or_steal_task( __TBB_atomic ref
 #if __TBB_TASK_PRIORITY
         // Check if any earlier offloaded non-top priority tasks become returned to the top level
         else if ( my_offloaded_tasks && (t=reload_tasks()) ) {
+            __TBB_ASSERT( !is_proxy(*t), "The proxy task cannot be offloaded" );
             // just proceed with the obtained task
         }
 #endif /* __TBB_TASK_PRIORITY */
@@ -245,8 +243,10 @@ task* custom_scheduler<SchedulerTraits>::receive_or_steal_task( __TBB_atomic ref
             goto fail;
         // A task was successfully obtained somewhere
         __TBB_ASSERT(t,NULL);
-#if __TBB_SCHEDULER_OBSERVER
+#if __TBB_ARENA_OBSERVER
         my_arena->my_observers.notify_entry_observers( my_last_local_observer, is_worker() );
+#endif
+#if __TBB_SCHEDULER_OBSERVER
         the_global_observer_list.notify_entry_observers( my_last_global_observer, is_worker() );
 #endif /* __TBB_SCHEDULER_OBSERVER */
         if ( SchedulerTraits::itt_possible && failure_count != -1 ) {
@@ -296,6 +296,7 @@ fail:
                     if ( t ) {
                         if( SchedulerTraits::itt_possible )
                             ITT_NOTIFY(sync_cancel, this);
+                        __TBB_ASSERT( !is_proxy(*t), "The proxy task cannot be offloaded" );
                         break; // exit stealing loop and return
                     }
                 }
@@ -418,6 +419,7 @@ void custom_scheduler<SchedulerTraits>::local_wait_for_all( task& parent, task* 
                 assert_context_valid(t->prefix().context);
                 if ( !t->prefix().context->my_cancellation_requested )
 #endif
+                // TODO: make the assert stronger by prohibiting allocated state.
                 __TBB_ASSERT( 1L<<t->state() & (1L<<task::allocated|1L<<task::ready|1L<<task::reexecute), NULL );
                 assert_task_pool_valid();
 #if __TBB_TASK_PRIORITY
@@ -574,10 +576,6 @@ stealing_ground:
 #endif /* __TBB_TASK_PRIORITY */
             return;
         }
-        // The following assertion may be falsely triggered in the presence of enqueued tasks
-        //__TBB_ASSERT( my_arena->my_max_num_workers > 0 || my_market->my_ref_count > 1
-        //              || parent.prefix().ref_count == 1, "deadlock detected" );
-
         // Dispatching task pointer is NULL *iff* this is a worker thread in its outermost
         // dispatch loop (i.e. its execution stack is empty). In this case it should exit it
         // either when there is no more work in the current arena, or when revoked by the market.
@@ -629,13 +627,8 @@ done:
     if ( !ConcurrentWaitsEnabled(parent) ) {
         if ( parent.prefix().ref_count != parents_work_done ) {
             // This is a worker that was revoked by the market.
-#if __TBB_TASK_ARENA
             __TBB_ASSERT( worker_outermost_level(),
                 "Worker thread exits nested dispatch loop prematurely" );
-#else
-            __TBB_ASSERT( is_worker() && worker_outermost_level(),
-                "Worker thread exits nested dispatch loop prematurely" );
-#endif
             return;
         }
         parent.prefix().ref_count = 0;

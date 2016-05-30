@@ -121,10 +121,10 @@ void arena::process( generic_scheduler& s ) {
     my_cpu_ctl_env.set_env();
 #endif
 
-#if __TBB_SCHEDULER_OBSERVER
+#if __TBB_ARENA_OBSERVER
     __TBB_ASSERT( !s.my_last_local_observer, "There cannot be notified local observers when entering arena" );
     my_observers.notify_entry_observers( s.my_last_local_observer, /*worker=*/true );
-#endif /* __TBB_SCHEDULER_OBSERVER */
+#endif /* __TBB_ARENA_OBSERVER */
 
     // Task pool can be marked as non-empty if the worker occupies the slot left by a master.
     if ( s.my_arena_slot->task_pool != EmptyTaskPool ) {
@@ -160,10 +160,10 @@ void arena::process( generic_scheduler& s ) {
             s.local_wait_for_all(*s.my_dummy_task,t);
         }
     }
-#if __TBB_SCHEDULER_OBSERVER
+#if __TBB_ARENA_OBSERVER
     my_observers.notify_exit_observers( s.my_last_local_observer, /*worker=*/true );
     s.my_last_local_observer = NULL;
-#endif /* __TBB_SCHEDULER_OBSERVER */
+#endif /* __TBB_ARENA_OBSERVER */
 #if __TBB_TASK_PRIORITY
     if ( s.my_offloaded_tasks )
         orphan_offloaded_tasks( s );
@@ -205,9 +205,9 @@ arena::arena ( market& m, unsigned num_slots, unsigned num_reserved_slots ) {
     my_bottom_priority = my_top_priority = normalized_normal_priority;
 #endif /* __TBB_TASK_PRIORITY */
     my_aba_epoch = m.my_arenas_aba_epoch;
-#if __TBB_SCHEDULER_OBSERVER
+#if __TBB_ARENA_OBSERVER
     my_observers.my_arena = this;
-#endif /* __TBB_SCHEDULER_OBSERVER */
+#endif
     __TBB_ASSERT ( my_max_num_workers <= my_num_slots, NULL );
     // Construct slots. Mark internal synchronization elements for the tools.
     for( unsigned i = 0; i < my_num_slots; ++i ) {
@@ -225,7 +225,7 @@ arena::arena ( market& m, unsigned num_slots, unsigned num_reserved_slots ) {
     my_task_stream.initialize(my_num_slots);
     ITT_SYNC_CREATE(&my_task_stream, SyncType_Scheduler, SyncObj_TaskStream);
 #if __TBB_ENQUEUE_ENFORCED_CONCURRENCY
-    my_mandatory_mode = no_mandatory;
+    my_concurrency_mode = cm_normal;
 #endif
 #if !__TBB_FP_CONTEXT
     my_cpu_ctl_env.get_env();
@@ -236,7 +236,7 @@ arena& arena::allocate_arena( market& m, unsigned num_slots, unsigned num_reserv
     __TBB_ASSERT( sizeof(base_type) + sizeof(arena_slot) == sizeof(arena), "All arena data fields must go to arena_base" );
     __TBB_ASSERT( sizeof(base_type) % NFS_GetLineSize() == 0, "arena slots area misaligned: wrong padding" );
     __TBB_ASSERT( sizeof(mail_outbox) == NFS_MaxLineSize, "Mailbox padding is wrong" );
-    size_t n = allocation_size(num_slots);
+    size_t n = allocation_size(num_arena_slots(num_slots));
     unsigned char* storage = (unsigned char*)NFS_Allocate( 1, n, NULL );
     // Zero all slots to indicate that they are empty
     memset( storage, 0, n );
@@ -249,7 +249,7 @@ void arena::free_arena () {
     __TBB_ASSERT( !my_num_workers_requested && !my_num_workers_allotted, "Dying arena requests workers" );
     __TBB_ASSERT( my_pool_state == SNAPSHOT_EMPTY || !my_max_num_workers, "Inconsistent state of a dying arena" );
 #if __TBB_ENQUEUE_ENFORCED_CONCURRENCY
-    __TBB_ASSERT( my_mandatory_mode != global_mandatory, NULL );
+    __TBB_ASSERT( my_concurrency_mode != cm_enforced_global, NULL );
 #endif
 #if !__TBB_STATISTICS_EARLY_DUMP
     GATHER_STATISTIC( dump_arena_statistics() );
@@ -258,11 +258,8 @@ void arena::free_arena () {
     intptr_t drained = 0;
     for ( unsigned i = 0; i < my_num_slots; ++i ) {
         __TBB_ASSERT( !my_slots[i].my_scheduler, "arena slot is not empty" );
-#if !__TBB_TASK_ARENA
-        __TBB_ASSERT( my_slots[i].task_pool == EmptyTaskPool, NULL );
-#else
-        //TODO: understand the assertion and modify
-#endif
+        // TODO: understand the assertion and modify
+        // __TBB_ASSERT( my_slots[i].task_pool == EmptyTaskPool, NULL );
         __TBB_ASSERT( my_slots[i].head == my_slots[i].tail, NULL ); // TODO: replace by is_quiescent_local_task_pool_empty
         my_slots[i].free_task_pool();
 #if __TBB_STATISTICS
@@ -280,16 +277,16 @@ void arena::free_arena () {
     my_default_ctx->~task_group_context();
     NFS_Free(my_default_ctx);
 #endif /* __TBB_TASK_GROUP_CONTEXT */
-#if __TBB_SCHEDULER_OBSERVER
+#if __TBB_ARENA_OBSERVER
     if ( !my_observers.empty() )
         my_observers.clear();
-#endif /* __TBB_SCHEDULER_OBSERVER */
+#endif /* __TBB_ARENA_OBSERVER */
     void* storage  = &mailbox(my_num_slots);
     __TBB_ASSERT( my_references == 0, NULL );
     __TBB_ASSERT( my_pool_state == SNAPSHOT_EMPTY || !my_max_num_workers, NULL );
     this->~arena();
 #if TBB_USE_ASSERT > 1
-    memset( storage, 0, allocation_size(my_max_num_workers) );
+    memset( storage, 0, allocation_size(my_num_slots) );
 #endif /* TBB_USE_ASSERT */
     NFS_Free( storage );
 }
@@ -331,11 +328,8 @@ void arena::dump_arena_statistics () {
 // 2. if it has any tasks at all, including those of lower priority (via tasks_present);
 // 3. if it is able to work with enqueued tasks (via dequeuing_possible).
 inline bool arena::may_have_tasks ( generic_scheduler* s, bool& tasks_present, bool& dequeuing_possible ) {
-    if ( !s
-#if __TBB_TASK_ARENA
-            || s->my_arena != this
-#endif
-            ) return false;
+    if ( !s || s->my_arena != this )
+        return false;
     dequeuing_possible |= s->worker_outermost_level();
     if ( s->my_pool_reshuffling_pending ) {
         // This primary task pool is nonempty and may contain tasks at the current
@@ -371,24 +365,21 @@ void arena::orphan_offloaded_tasks(generic_scheduler& s) {
 }
 #endif /* __TBB_TASK_PRIORITY */
 
-void arena::restore_priorities_if_need() {
+bool arena::has_enqueued_tasks() {
+    // Look for enqueued tasks at all priority levels
+    for ( int p = 0; p < num_priority_levels; ++p )
+        if ( !my_task_stream.empty(p) )
+            return true;
+    return false;
+}
+
+void arena::restore_priority_if_need() {
     // Check for the presence of enqueued tasks "lost" on some of
     // priority levels because updating arena priority and switching
     // arena into "populated" (FULL) state happen non-atomically.
     // Imposing atomicity would require task::enqueue() to use a lock,
     // which is unacceptable.
-#if __TBB_TASK_PRIORITY
-    bool switch_back = false;
-    for ( int p = 0; p < num_priority_levels; ++p ) {
-        if ( !my_task_stream.empty(p) ) {
-            switch_back = true;
-            break;
-        }
-    }
-#else
-    bool switch_back = !my_task_stream.empty(0);
-#endif /* __TBB_TASK_PRIORITY */
-    if ( switch_back ) {
+    if ( has_enqueued_tasks() ) {
         advertise_new_work<work_enqueued>();
 #if __TBB_TASK_PRIORITY
         // update_arena_priority() expects non-zero arena::my_num_workers_requested,
@@ -506,17 +497,17 @@ bool arena::is_out_of_work() {
                                 int current_demand = (int)my_max_num_workers;
                                 if( my_pool_state.compare_and_swap( SNAPSHOT_EMPTY, busy )==busy ) {
 #if __TBB_ENQUEUE_ENFORCED_CONCURRENCY
-                                    if( my_mandatory_mode==global_mandatory ) {
+                                    if( my_concurrency_mode==cm_enforced_global  ) {
                                         // adjust_demand() called inside, if needed
                                         my_market->mandatory_concurrency_disable( this );
                                     } else
 #endif /* __TBB_ENQUEUE_ENFORCED_CONCURRENCY */
                                     {
                                         // This thread transitioned pool to empty state, and thus is
-                                        // responsible for telling RML that there is no other work to do.
+                                        // responsible for telling the market that there is no work to do.
                                         my_market->adjust_demand( *this, -current_demand );
                                     }
-                                    restore_priorities_if_need();
+                                    restore_priority_if_need();
                                     return true;
                                 }
                                 return false;
@@ -587,7 +578,6 @@ void arena::enqueue_task( task& t, intptr_t prio, FastRandom &random )
 #endif /* __TBB_TASK_PRIORITY */
 }
 
-#if __TBB_TASK_ARENA
 struct nested_arena_context : no_copy {
     generic_scheduler &my_scheduler;
     scheduler_state const my_orig_state;
@@ -648,7 +638,7 @@ void generic_scheduler::nested_arena_exit(nested_arena_context& c) {
     if( !my_is_worker && my_arena_index >= my_arena->my_num_reserved_slots ) my_arena->my_market->adjust_demand(*my_arena, 1);
 #if __TBB_ARENA_OBSERVER
     my_arena->my_observers.notify_exit_observers( my_last_local_observer, /*worker=*/false );
-#endif /* __TBB_SCHEDULER_OBSERVER */
+#endif /* __TBB_ARENA_OBSERVER */
 
 #if __TBB_TASK_PRIORITY
     if ( my_offloaded_tasks )
@@ -672,13 +662,11 @@ void generic_scheduler::wait_until_empty() {
     my_dummy_task->prefix().ref_count--;
 }
 
-#endif /* __TBB_TASK_ARENA */
-
 } // namespace internal
 } // namespace tbb
 
-#if __TBB_TASK_ARENA
 #include "scheduler_utility.h"
+#include "tbb/task_arena.h" // task_arena_base
 
 namespace tbb {
 namespace interface7 {
@@ -945,4 +933,3 @@ void task_arena_base::internal_wait() const {
 } // tbb::interfaceX::internal
 } // tbb::interfaceX
 } // tbb
-#endif /* __TBB_TASK_ARENA */
