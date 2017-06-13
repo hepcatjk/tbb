@@ -1,21 +1,21 @@
 /*
-    Copyright 2005-2016 Intel Corporation.  All Rights Reserved.
+    Copyright (c) 2005-2017 Intel Corporation
 
-    This file is part of Threading Building Blocks. Threading Building Blocks is free software;
-    you can redistribute it and/or modify it under the terms of the GNU General Public License
-    version 2  as  published  by  the  Free Software Foundation.  Threading Building Blocks is
-    distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the
-    implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-    See  the GNU General Public License for more details.   You should have received a copy of
-    the  GNU General Public License along with Threading Building Blocks; if not, write to the
-    Free Software Foundation, Inc.,  51 Franklin St,  Fifth Floor,  Boston,  MA 02110-1301 USA
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
 
-    As a special exception,  you may use this file  as part of a free software library without
-    restriction.  Specifically,  if other files instantiate templates  or use macros or inline
-    functions from this file, or you compile this file and link it with other files to produce
-    an executable,  this file does not by itself cause the resulting executable to be covered
-    by the GNU General Public License. This exception does not however invalidate any other
-    reasons why the executable file might be covered by the GNU General Public License.
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+
+
+
+
 */
 
 #include <string.h>   /* for memset */
@@ -87,7 +87,7 @@ void HugePagesStatus::printStatus() {
 
 void HugePagesStatus::doPrintStatus(bool state, const char *stateName)
 {
-    // Under OS X* fprintf/snprintf acquires an internal lock, so when
+    // Under macOS* fprintf/snprintf acquires an internal lock, so when
     // 1st allocation is done under the lock, we got a deadlock.
     // Do not use fprintf etc during initialization.
     fputs("TBBmalloc: huge pages\t", stderr);
@@ -142,21 +142,22 @@ void *Backend::allocRawMem(size_t &size)
         allocSize = alignUpGeneric(size, extMemPool->granularity);
         res = (*extMemPool->rawAlloc)(extMemPool->poolId, allocSize);
     } else {
+        // check if alignment to huge page size is recommended
+        size_t hugePageSize = hugePages.recommendedGranularity();
+        allocSize = alignUpGeneric(size, hugePageSize? hugePageSize : extMemPool->granularity);
         // try to get them at 1st allocation and still use, if successful
         // if 1st try is unsuccessful, no more trying
         if (FencedLoad(hugePages.enabled)) {
-            allocSize = alignUpGeneric(size, hugePages.getSize());
+            MALLOC_ASSERT(hugePageSize, "Inconsistent state of HugePagesStatus");
             res = getRawMemory(allocSize, /*hugePages=*/true);
             hugePages.registerAllocation(res);
         }
 
-        if ( !res ) {
-            allocSize = alignUpGeneric(size, extMemPool->granularity);
+        if (!res)
             res = getRawMemory(allocSize, /*hugePages=*/false);
-        }
     }
 
-    if ( res ) {
+    if (res) {
         MALLOC_ASSERT(allocSize > 0, "Invalid size of an allocated region.");
         size = allocSize;
         if (!extMemPool->userPool())
@@ -239,7 +240,7 @@ struct MemRegion {
     MemRegion *next,      // keep all regions in any pool to release all them on
               *prev;      // pool destroying, 2-linked list to release individual
                           // regions.
-    size_t     allocSz,   // got from poll callback
+    size_t     allocSz,   // got from pool callback
                blockSz;   // initial and maximal inner block size
     MemRegionType type;
 };
@@ -760,7 +761,7 @@ FreeBlock *Backend::askMemFromOS(size_t blockSize, intptr_t startModifiedCnt,
             return (FreeBlock*)VALID_BLOCK_IN_BIN;
         }
 
-        if ( blockSize < quiteSmall ) {
+        if (blockSize < quiteSmall) {
             // For this size of blocks, add NUM_OF_REG "advance" regions in bin,
             // and return one as a result.
             // TODO: add to bin first, because other threads can use them right away.
@@ -1207,7 +1208,7 @@ bool Backend::coalescAndPutList(FreeBlock *list, bool forceCoalescQDrop,
         bool needAddToBin = true;
 
         if (toRet->blockInBin) {
-            // is it stay in same bin?
+            // Does it stay in same bin?
             if (toRet->myBin == bin && toRet->aligned == toAligned)
                 needAddToBin = false;
             else {
@@ -1216,7 +1217,7 @@ bool Backend::coalescAndPutList(FreeBlock *list, bool forceCoalescQDrop,
             }
         }
 
-        // not stay in same bin, or bin-less, add it
+        // Does not stay in same bin, or bin-less; add it
         if (needAddToBin) {
             toRet->prev = toRet->next = toRet->nextToFree = NULL;
             toRet->myBin = NO_BIN;
@@ -1279,7 +1280,7 @@ FreeBlock *Backend::findBlockInRegion(MemRegion *region, size_t exactBlockSize)
 
     MALLOC_STATIC_ASSERT(sizeof(LastFreeBlock) % sizeof(uintptr_t) == 0,
         "Atomic applied on LastFreeBlock, and we put it at the end of region, that"
-        " is uintptr_t-aligned, so no unaligned atomic opeartions are possible.");
+        " is uintptr_t-aligned, so no unaligned atomic operations are possible.");
      // right bound is slab-aligned, keep LastFreeBlock after it
     if (region->type==MEMREG_FLEXIBLE_SIZE) {
         fBlock = (FreeBlock *)alignUp((uintptr_t)region + sizeof(MemRegion),
@@ -1455,8 +1456,10 @@ bool Backend::destroy()
 
 bool Backend::clean()
 {
+    scanCoalescQ(/*forceCoalescQDrop=*/false);
+
     bool res = false;
-    // We can have several blocks, occupaing whole region,
+    // We can have several blocks occupying a whole region,
     // because such regions are added in advance (see askMemFromOS() and reset()),
     // and never used. Release them all.
     for (int i = advRegBins.getMinUsedBin(0); i != -1; i = advRegBins.getMinUsedBin(i+1)) {
@@ -1465,8 +1468,6 @@ bool Backend::clean()
         if (i == freeLargeBins.getMinNonemptyBin(i))
             res |= freeLargeBins.tryReleaseRegions(i, this);
     }
-
-    scanCoalescQ(/*forceCoalescQDrop=*/false);
 
     return res;
 }
